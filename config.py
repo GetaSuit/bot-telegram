@@ -3,8 +3,8 @@
 #  Modifie ce fichier selon tes besoins
 # ============================================================
 
-TELEGRAM_TOKEN = "COLLE_TON_TOKEN_ICI"   # @BotFather
-CHAT_ID        = "COLLE_TON_CHAT_ID_ICI" # /start dans le bot pour l'obtenir
+TELEGRAM_TOKEN = "8773112253:AAFuACN55hxcRmsPI3xYXj-6A2aGRh0so8k"   # @BotFather
+CHAT_ID        = "1014790204" # /start dans le bot pour l'obtenir
 
 # Intervalle de scan en minutes
 SCAN_INTERVAL_MIN = 60
