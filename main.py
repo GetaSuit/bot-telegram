@@ -1,399 +1,218 @@
 """
-main.py — Bot Telegram Sourcing Luxe
-────────────────────────────────────
-Commandes disponibles :
-  /start       → Bienvenue + aide
-  /scan        → Lance un scan immédiat
-  /pepites     → Affiche les pépites du dernier scan
-  /marque Brioni → Recherche une marque spécifique
-  /favoris     → Liste tes articles favoris
-  /stats       → Statistiques du bot
-  /reset       → Vide le cache des articles vus
-  /aide        → Rappel des commandes
+main.py — Bot Telegram Sourcing Luxe (version corrigée)
 """
 
 import logging
 import asyncio
 from datetime import datetime
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputMediaPhoto,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes,
 )
 from telegram.constants import ParseMode
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import config
 import database as db
-from scrapers import scrape_all, scrape_vinted, scrape_vestiaire, scrape_ebay, scrape_leboncoin
+from scrapers import scrape_all
 from config import (
     TELEGRAM_TOKEN, CHAT_ID, SCAN_INTERVAL_MIN,
-    ALL_BRANDS, FORBIDDEN_MATERIALS, NOBLE_MATERIALS,
+    ALL_BRANDS, FORBIDDEN_MATERIALS,
     get_tier, estimated_sell_price, margin_pct, is_pepite,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Statistiques en mémoire ───────────────────────────────
-stats = {
-    "scans": 0,
-    "articles_found": 0,
-    "pepites_found": 0,
-    "last_scan": None,
-}
-
+stats = {"scans": 0, "articles_found": 0, "pepites_found": 0, "last_scan": None}
 last_scan_results: list[dict] = []
 
+PLATFORM_EMOJI = {"Vinted": "🟢", "Vestiaire Collective": "⚫", "eBay": "🔵", "Leboncoin": "🟠"}
+TIER_LABEL = {"T1": "⭐ Sartorial", "T2": "✦ Grand luxe", "T3": "◆ Luxe"}
 
-# ─────────────────────────────────────────────────────────────────
-#  FILTRAGE & ENRICHISSEMENT
-# ─────────────────────────────────────────────────────────────────
-
-def _has_forbidden_material(item: dict) -> bool:
+def _has_forbidden_material(item):
     text = (item.get("title", "") + " " + item.get("description", "")).lower()
     return any(m in text for m in FORBIDDEN_MATERIALS)
 
-
-def _size_ok(item: dict) -> bool:
+def _size_ok(item):
     size = item.get("size", "").strip()
     if not size:
-        return True  # pas de taille → on laisse passer
-    all_sizes = config.SIZES_MEN + config.SIZES_WOMEN
-    return any(s.lower() in size.lower() for s in all_sizes)
+        return True
+    return any(s.lower() in size.lower() for s in config.SIZES_MEN + config.SIZES_WOMEN)
 
-
-def _enrich(item: dict) -> dict:
-    """Ajoute tier, marge estimée, flag pépite."""
-    brand = item.get("brand", "")
-    tier  = get_tier(brand)
-    buy   = item["price"]
-    sell  = estimated_sell_price(buy, tier)
-    marge = margin_pct(buy, tier)
-    pep   = is_pepite(buy, tier)
-
-    item["tier"]            = tier
-    item["sell_estimated"]  = sell
-    item["margin_pct"]      = marge
-    item["pepite"]          = pep
+def _enrich(item):
+    tier = get_tier(item.get("brand", ""))
+    buy  = item["price"]
+    item["tier"] = tier
+    item["sell_estimated"] = estimated_sell_price(buy, tier)
+    item["margin_pct"] = margin_pct(buy, tier)
+    item["pepite"] = is_pepite(buy, tier)
     return item
 
-
-def filter_and_enrich(items: list[dict]) -> list[dict]:
+def filter_and_enrich(items):
     out = []
     for it in items:
-        if _has_forbidden_material(it):
-            continue
-        if not _size_ok(it):
-            continue
-        if db.is_seen(it["url"]):
-            continue
-        it = _enrich(it)
-        out.append(it)
+        if _has_forbidden_material(it): continue
+        if not _size_ok(it): continue
+        if db.is_seen(it["url"]): continue
+        out.append(_enrich(it))
     return out
 
-
-# ─────────────────────────────────────────────────────────────────
-#  FORMATEUR DE MESSAGES TELEGRAM
-# ─────────────────────────────────────────────────────────────────
-
-PLATFORM_EMOJI = {
-    "Vinted":               "🟢",
-    "Vestiaire Collective": "⚫",
-    "eBay":                 "🔵",
-    "Leboncoin":            "🟠",
-}
-
-TIER_LABEL = {"T1": "⭐ Sartorial", "T2": "✦ Grand luxe", "T3": "◆ Luxe"}
-
-
-def format_item_message(item: dict) -> str:
-    pep_line  = "🔥 *PÉPITE DÉTECTÉE* 🔥\n\n" if item["pepite"] else ""
-    platform  = item["platform"]
-    emoji_pl  = PLATFORM_EMOJI.get(platform, "•")
-    tier_lbl  = TIER_LABEL.get(item["tier"], "")
-
-    lines = [
-        pep_line,
-        f"*{item['title']}*\n",
-        f"{emoji_pl} {platform}  |  {tier_lbl}\n",
-        f"💰 Achat : *{item['price']:.0f} €*\n",
-        f"📈 Revente estimée : *{item['sell_estimated']} €*\n",
-        f"📊 Marge : *+{item['margin_pct']}%*\n",
-    ]
+def format_item_message(item):
+    pep  = "🔥 *PÉPITE DÉTECTÉE* 🔥\n\n" if item["pepite"] else ""
+    pl   = PLATFORM_EMOJI.get(item["platform"], "•")
+    tier = TIER_LABEL.get(item["tier"], "")
+    msg  = (f"{pep}*{item['title']}*\n\n{pl} {item['platform']}  |  {tier}\n"
+            f"💰 Achat : *{item['price']:.0f} €*\n"
+            f"📈 Revente estimée : *{item['sell_estimated']} €*\n"
+            f"📊 Marge : *+{item['margin_pct']}%*\n")
     if item.get("size"):
-        lines.append(f"📐 Taille : {item['size']}\n")
-    lines.append(f"\n🔗 [Voir l'article]({item['url']})")
-    return "".join(lines)
+        msg += f"📐 Taille : {item['size']}\n"
+    msg += f"\n🔗 [Voir l'article]({item['url']})"
+    return msg
 
+def item_keyboard(item):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⭐ Favori", callback_data=f"fav|{item['url']}|{item['title'][:40]}"),
+        InlineKeyboardButton("🔗 Ouvrir", url=item["url"]),
+    ]])
 
-def item_keyboard(item: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⭐ Ajouter aux favoris", callback_data=f"fav|{item['url']}|{item['title']}"),
-            InlineKeyboardButton("🔗 Ouvrir", url=item["url"]),
-        ]
-    ])
-
-
-# ─────────────────────────────────────────────────────────────────
-#  ENVOI D'UNE ALERTE
-# ─────────────────────────────────────────────────────────────────
-
-async def send_item_alert(app: Application, item: dict):
-    text    = format_item_message(item)
-    keyboard = item_keyboard(item)
-    chat    = CHAT_ID
-
+async def send_item_alert(app, item):
+    text = format_item_message(item)
+    kb   = item_keyboard(item)
     try:
         if item.get("image_url"):
-            await app.bot.send_photo(
-                chat_id   = chat,
-                photo     = item["image_url"],
-                caption   = text,
-                parse_mode= ParseMode.MARKDOWN,
-                reply_markup=keyboard,
-            )
+            await app.bot.send_photo(chat_id=CHAT_ID, photo=item["image_url"],
+                caption=text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         else:
-            await app.bot.send_message(
-                chat_id   = chat,
-                text      = text,
-                parse_mode= ParseMode.MARKDOWN,
-                reply_markup=keyboard,
-                disable_web_page_preview=False,
-            )
+            await app.bot.send_message(chat_id=CHAT_ID, text=text,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         db.mark_seen(item["url"], item["title"])
     except Exception as e:
-        log.error(f"Erreur envoi alerte: {e}")
-        # Fallback sans image
+        log.error(f"Erreur envoi: {e}")
         try:
-            await app.bot.send_message(
-                chat_id=chat, text=text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=keyboard,
-            )
+            await app.bot.send_message(chat_id=CHAT_ID, text=text,
+                parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
             db.mark_seen(item["url"], item["title"])
         except Exception as e2:
-            log.error(f"Fallback aussi échoué: {e2}")
+            log.error(f"Fallback échoué: {e2}")
 
-
-# ─────────────────────────────────────────────────────────────────
-#  SCAN PRINCIPAL
-# ─────────────────────────────────────────────────────────────────
-
-async def run_scan(app: Application, brands: list[str] = None, silent: bool = False):
+async def run_scan(app, brands=None, silent=False):
     global last_scan_results
-    target_brands = brands or ALL_BRANDS
+    target = brands or ALL_BRANDS
     stats["scans"] += 1
     stats["last_scan"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-
     if not silent:
-        await app.bot.send_message(
-            CHAT_ID,
-            f"🔍 Scan en cours sur {len(target_brands)} marques...\n"
-            f"Plateformes : Vinted · Vestiaire · eBay · Leboncoin"
-        )
-
-    all_items  = []
-    new_items  = []
-    pepites    = []
-
-    for brand in target_brands:
-        raw = scrape_all(brand, max_price=2000)
-        filtered = filter_and_enrich(raw)
-        all_items.extend(filtered)
+        await app.bot.send_message(CHAT_ID,
+            f"🔍 Scan en cours sur {len(target)} marques...\nPlateformes : Vinted · Vestiaire · eBay · Leboncoin")
+    pepites, autres = [], []
+    for brand in target:
+        filtered = filter_and_enrich(scrape_all(brand, max_price=2000))
         for it in filtered:
-            if it["pepite"]:
-                pepites.append(it)
-            else:
-                new_items.append(it)
-
-    # Trier pépites en premier, puis par marge décroissante
+            (pepites if it["pepite"] else autres).append(it)
     pepites.sort(key=lambda x: x["margin_pct"], reverse=True)
-    new_items.sort(key=lambda x: x["margin_pct"], reverse=True)
-    ordered = pepites + new_items
+    autres.sort(key=lambda x: x["margin_pct"], reverse=True)
+    ordered = pepites + autres
     last_scan_results = ordered
-
     stats["articles_found"] += len(ordered)
     stats["pepites_found"]  += len(pepites)
-
     if not ordered:
         if not silent:
             await app.bot.send_message(CHAT_ID, "✅ Scan terminé — aucun nouvel article trouvé.")
         return
+    await app.bot.send_message(CHAT_ID,
+        f"✅ *Scan terminé*\n\n📦 Articles : *{len(ordered)}*\n🔥 Pépites : *{len(pepites)}*\n\nEnvoi des alertes...",
+        parse_mode=ParseMode.MARKDOWN)
+    for it in pepites[:10]:
+        await send_item_alert(app, it); await asyncio.sleep(0.5)
+    for it in autres[:20]:
+        await send_item_alert(app, it); await asyncio.sleep(0.5)
 
-    # Résumé
-    summary = (
-        f"✅ *Scan terminé*\n\n"
-        f"📦 Nouveaux articles : *{len(ordered)}*\n"
-        f"🔥 Pépites : *{len(pepites)}*\n\n"
-        f"Envoi des alertes..."
-    )
-    await app.bot.send_message(CHAT_ID, summary, parse_mode=ParseMode.MARKDOWN)
-
-    # Envoyer pépites en premier
-    for item in pepites[:10]:
-        await send_item_alert(app, item)
-        await asyncio.sleep(0.5)
-
-    # Puis les autres (max 20 pour ne pas spammer)
-    for item in new_items[:20]:
-        await send_item_alert(app, item)
-        await asyncio.sleep(0.5)
-
-
-# ─────────────────────────────────────────────────────────────────
-#  COMMANDES TELEGRAM
-# ─────────────────────────────────────────────────────────────────
+async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    await run_scan(context.application, silent=True)
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"👔 *Bot Sourcing Luxe*\n\n"
-        f"Ton chat ID : `{chat_id}`\n\n"
-        f"*Commandes disponibles :*\n"
-        f"/scan — Lance un scan immédiat\n"
-        f"/pepites — Affiche les pépites du dernier scan\n"
-        f"/marque Brioni — Cherche une marque spécifique\n"
-        f"/favoris — Tes articles favoris\n"
-        f"/stats — Statistiques\n"
-        f"/reset — Vide le cache\n"
-        f"/aide — Cette aide",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
+        f"👔 *Bot Sourcing Luxe*\n\nTon chat ID : `{update.effective_chat.id}`\n\n"
+        f"/scan — Scan immédiat\n/pepites — Pépites du dernier scan\n"
+        f"/marque Brioni — Cherche une marque\n/favoris — Tes favoris\n"
+        f"/stats — Statistiques\n/reset — Vide le cache",
+        parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚀 Scan lancé...")
     await run_scan(ctx.application)
 
-
 async def cmd_pepites(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pepites = [it for it in last_scan_results if it.get("pepite")]
-    if not pepites:
-        await update.message.reply_text(
-            "Aucune pépite dans le dernier scan. Lance /scan pour actualiser."
-        )
+    peps = [it for it in last_scan_results if it.get("pepite")]
+    if not peps:
+        await update.message.reply_text("Aucune pépite. Lance /scan pour actualiser.")
         return
-    await update.message.reply_text(f"🔥 *{len(pepites)} pépite(s)* trouvée(s) :", parse_mode=ParseMode.MARKDOWN)
-    for it in pepites[:10]:
-        await send_item_alert(ctx.application, it)
-        await asyncio.sleep(0.4)
-
+    await update.message.reply_text(f"🔥 *{len(peps)} pépite(s) :*", parse_mode=ParseMode.MARKDOWN)
+    for it in peps[:10]:
+        await send_item_alert(ctx.application, it); await asyncio.sleep(0.4)
 
 async def cmd_marque(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("Usage : /marque NomDeLaMarque\nEx : /marque Brioni")
-        return
+        await update.message.reply_text("Usage : /marque Brioni"); return
     brand = " ".join(ctx.args)
-    await update.message.reply_text(f"🔍 Recherche *{brand}* sur toutes les plateformes...", parse_mode=ParseMode.MARKDOWN)
-    raw      = scrape_all(brand, max_price=2000)
-    filtered = filter_and_enrich(raw)
+    await update.message.reply_text(f"🔍 Recherche *{brand}*...", parse_mode=ParseMode.MARKDOWN)
+    filtered = filter_and_enrich(scrape_all(brand, max_price=2000))
     filtered.sort(key=lambda x: x["margin_pct"], reverse=True)
     if not filtered:
-        await update.message.reply_text(f"Aucun article trouvé pour *{brand}*.", parse_mode=ParseMode.MARKDOWN)
-        return
-    await update.message.reply_text(f"✅ *{len(filtered)} article(s)* trouvé(s) pour *{brand}* :", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"Aucun article pour *{brand}*.", parse_mode=ParseMode.MARKDOWN); return
+    await update.message.reply_text(f"✅ *{len(filtered)} article(s) :*", parse_mode=ParseMode.MARKDOWN)
     for it in filtered[:8]:
-        await send_item_alert(ctx.application, it)
-        await asyncio.sleep(0.4)
-
+        await send_item_alert(ctx.application, it); await asyncio.sleep(0.4)
 
 async def cmd_favoris(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     favs = db.list_favorites()
     if not favs:
-        await update.message.reply_text("Tu n'as pas encore de favoris.\nClique sur ⭐ sous un article pour en ajouter.")
-        return
-    await update.message.reply_text(f"⭐ *Tes {len(favs)} favori(s) :*", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Pas encore de favoris — clique ⭐ sous un article."); return
+    await update.message.reply_text(f"⭐ *{len(favs)} favori(s) :*", parse_mode=ParseMode.MARKDOWN)
     for it in favs:
-        text = (
-            f"*{it['title']}*\n"
-            f"💰 {it['price']:.0f}€ → ~{it.get('sell_estimated', '?')}€\n"
-            f"📊 +{it.get('margin_pct', '?')}%\n"
-            f"🔗 [Voir]({it['url']})"
-        )
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🗑 Retirer des favoris", callback_data=f"unfav|{it['url']}"),
+        text = (f"*{it['title']}*\n💰 {it['price']:.0f}€ → ~{it.get('sell_estimated','?')}€  "
+                f"📊 +{it.get('margin_pct','?')}%\n🔗 [Voir]({it['url']})")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Retirer", callback_data=f"unfav|{it['url']}"),
             InlineKeyboardButton("🔗 Ouvrir", url=it["url"]),
         ]])
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         await asyncio.sleep(0.3)
 
-
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    favs = db.list_favorites()
-    msg = (
-        f"📊 *Statistiques du bot*\n\n"
-        f"🔍 Scans effectués : {stats['scans']}\n"
-        f"📦 Articles analysés : {stats['articles_found']}\n"
-        f"🔥 Pépites trouvées : {stats['pepites_found']}\n"
-        f"⭐ Favoris : {len(favs)}\n"
-        f"🕐 Dernier scan : {stats['last_scan'] or 'jamais'}\n"
-        f"⏱ Scan auto toutes les {SCAN_INTERVAL_MIN} min"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
+    await update.message.reply_text(
+        f"📊 *Statistiques*\n\n🔍 Scans : {stats['scans']}\n📦 Articles : {stats['articles_found']}\n"
+        f"🔥 Pépites : {stats['pepites_found']}\n⭐ Favoris : {len(db.list_favorites())}\n"
+        f"🕐 Dernier scan : {stats['last_scan'] or 'jamais'}\n⏱ Auto toutes les {SCAN_INTERVAL_MIN} min",
+        parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db.clear_seen()
-    await update.message.reply_text("✅ Cache vidé — le prochain scan renverra tous les articles.")
-
-
-async def cmd_aide(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await cmd_start(update, ctx)
-
-
-# ─────────────────────────────────────────────────────────────────
-#  CALLBACKS BOUTONS INLINE
-# ─────────────────────────────────────────────────────────────────
+    await update.message.reply_text("✅ Cache vidé.")
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
-
+    data  = query.data
     if data.startswith("fav|"):
         _, url, title = data.split("|", 2)
-        # Trouver l'item complet dans les résultats
-        item = next((it for it in last_scan_results if it["url"] == url), None)
-        if not item:
-            item = {"url": url, "title": title, "price": 0}
-        added = db.add_favorite(item)
-        if added:
-            await query.edit_message_reply_markup(
-                InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Ajouté aux favoris", callback_data="noop"),
-                    InlineKeyboardButton("🔗 Ouvrir", url=url),
-                ]])
-            )
-        else:
-            await query.answer("Déjà dans tes favoris !")
-
+        item = next((it for it in last_scan_results if it["url"] == url), {"url": url, "title": title, "price": 0})
+        if db.add_favorite(item):
+            await query.edit_message_reply_markup(InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Ajouté", callback_data="noop"),
+                InlineKeyboardButton("🔗 Ouvrir", url=url),
+            ]]))
     elif data.startswith("unfav|"):
         _, url = data.split("|", 1)
         db.remove_favorite(url)
-        await query.edit_message_reply_markup(
-            InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗑 Retiré", callback_data="noop"),
-            ]])
-        )
-
-
-# ─────────────────────────────────────────────────────────────────
-#  LANCEMENT
-# ─────────────────────────────────────────────────────────────────
+        await query.edit_message_reply_markup(InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Retiré", callback_data="noop"),
+        ]]))
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Commandes
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("scan",    cmd_scan))
     app.add_handler(CommandHandler("pepites", cmd_pepites))
@@ -401,22 +220,10 @@ def main():
     app.add_handler(CommandHandler("favoris", cmd_favoris))
     app.add_handler(CommandHandler("stats",   cmd_stats))
     app.add_handler(CommandHandler("reset",   cmd_reset))
-    app.add_handler(CommandHandler("aide",    cmd_aide))
     app.add_handler(CallbackQueryHandler(callback_handler))
-
-    # Scheduler — scan automatique
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        lambda: asyncio.create_task(run_scan(app, silent=True)),
-        "interval",
-        minutes=SCAN_INTERVAL_MIN,
-        id="auto_scan",
-    )
-    scheduler.start()
-
+    app.job_queue.run_repeating(auto_scan_job, interval=SCAN_INTERVAL_MIN * 60, first=30)
     log.info(f"Bot démarré — scan toutes les {SCAN_INTERVAL_MIN} min")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
